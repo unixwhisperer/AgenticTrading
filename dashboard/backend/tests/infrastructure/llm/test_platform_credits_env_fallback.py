@@ -563,7 +563,7 @@ def test_two_quota_failures_stop_after_commonstack(tmp_path, monkeypatch):
     assert len(fallback.calls) == 1
 
 
-def test_byok_usage_reports_tokens_with_zero_atl_cost(monkeypatch):
+def _emit_byok_usage(monkeypatch, *, model_id=MODEL_ID, usage=None, billing=None):
     events = []
     monkeypatch.setattr(
         execution_service_module.analytics_instrumentation,
@@ -571,64 +571,71 @@ def test_byok_usage_reports_tokens_with_zero_atl_cost(monkeypatch):
         lambda **kwargs: events.append(kwargs),
     )
     request = _request("analytics-byok-run").model_copy(
-        update={"billing_mode": BillingMode.BYOK}
+        update={"billing_mode": BillingMode.BYOK, "model_id": model_id}
     )
     result = LLMExecutionResult(
         text="BUY",
         provider_id="openrouter",
-        model_id=MODEL_ID,
-        usage=LLMUsage(input_tokens=50, output_tokens=25),
-        billing=BillingEvidence(
-            billing_source=BillingMode.BYOK,
-            usage_authority="not_billable_by_atl",
-            provider_cost_usd=99.0,
-        ),
-    )
-
-    LLMExecutionService._emit_model_usage(request, result)
-
-    assert events[0]["billing_mode"] == "byok"
-    assert events[0]["properties"] == {
-        "input_tokens": 50,
-        "output_tokens": 25,
-        "cost_micro_usd": 0,
-    }
-
-
-def test_byok_usage_records_the_platform_price_estimate(monkeypatch):
-    """BYOK debits nothing, but the lane must still be expressible in Credits:
-    the event carries the platform list-price estimate of the same tokens,
-    never the provider cost the user paid on their own key."""
-    events = []
-    monkeypatch.setattr(
-        execution_service_module.analytics_instrumentation,
-        "emit_resource_event",
-        lambda **kwargs: events.append(kwargs),
-    )
-    request = _request("analytics-byok-estimate-run").model_copy(
-        update={"billing_mode": BillingMode.BYOK}
-    )
-    result = LLMExecutionResult(
-        text="BUY",
-        provider_id="openrouter",
-        model_id=MODEL_ID,
-        usage=LLMUsage(input_tokens=50, output_tokens=25),
-        billing=BillingEvidence(
+        model_id=model_id,
+        usage=usage or LLMUsage(input_tokens=50, output_tokens=25),
+        billing=billing
+        or BillingEvidence(
             billing_source=BillingMode.BYOK,
             usage_authority="provider_usage_pricing_snapshot",
             provider_cost_usd=99.0,
             estimated_cost_usd=0.42,
         ),
     )
-
     LLMExecutionService._emit_model_usage(request, result)
-
     assert events[0]["billing_mode"] == "byok"
-    assert events[0]["properties"] == {
+    return events[0]["properties"]
+
+
+def test_byok_usage_reports_zero_atl_cost_and_a_separate_list_price_estimate(
+    monkeypatch,
+):
+    """BYOK debits nothing, so cost_micro_usd -- ATL cost everywhere else -- is
+    0. The lane is still expressible in Credits through its own property: the
+    table's list price of the same tokens (openai/gpt-5.5 at $5/$30 per M:
+    50 in + 25 out = $0.001). Never the provider cost the user paid on their
+    own key, and never the call's estimated_cost_usd, whose snapshot would
+    have priced an unlisted model at the $1/$5 fallback."""
+    assert _emit_byok_usage(monkeypatch) == {
         "input_tokens": 50,
         "output_tokens": 25,
-        "cost_micro_usd": 420_000,
+        "cost_micro_usd": 0,
+        "estimated_cost_micro_usd": 1_000,
     }
+
+
+def test_byok_usage_is_unpriced_when_the_model_is_not_listed(monkeypatch):
+    """An unlisted model has no list price. Pricing it at the fallback would
+    publish an invented figure, so the estimate is left out and the call
+    counts as unpriced."""
+    assert _emit_byok_usage(monkeypatch, model_id="acme/unlisted-model") == {
+        "input_tokens": 50,
+        "output_tokens": 25,
+        "cost_micro_usd": 0,
+    }
+
+
+def test_byok_usage_is_unpriced_when_the_provider_reported_no_usage(monkeypatch):
+    properties = _emit_byok_usage(
+        monkeypatch,
+        usage=LLMUsage(input_tokens=0, output_tokens=0, usage_available=False),
+        billing=BillingEvidence(
+            billing_source=BillingMode.BYOK,
+            usage_authority="unavailable",
+        ),
+    )
+    assert properties == {"input_tokens": 0, "output_tokens": 0, "cost_micro_usd": 0}
+
+
+def test_byok_usage_on_a_free_variant_is_priced_at_zero(monkeypatch):
+    """OpenRouter's :free variant costs nothing: a real, priced 0 -- not its
+    paid sibling's rate, and not unpriced."""
+    properties = _emit_byok_usage(monkeypatch, model_id="openai/gpt-5.5:free")
+    assert properties["estimated_cost_micro_usd"] == 0
 
 
 def test_execution_failure_emits_only_safe_error_category(
@@ -1403,3 +1410,46 @@ def test_byok_waits_out_a_long_retry_after_rather_than_aborting(
 
     assert h.service.execute(request) == "ok"
     assert h.sleeps == [45.0]
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        ("temperature=0.0;thinking=disabled", "temperature=0.0;thinking=disabled"),
+        (None, None),
+        # Evidence, not the answer: an over-long value is dropped, never
+        # allowed to fail a call that has already been settled.
+        ("x" * 200, None),
+    ],
+)
+def test_the_adapters_sampling_wire_reaches_the_result(
+    tmp_path, monkeypatch, wire, expected
+):
+    monkeypatch.setenv("COMMONSTACK_API_KEY", "cs-fake-wire-abcd")
+    primary_adapter = ScriptedExecutionAdapter(
+        [ProviderExecutionError(ExecutionErrorCategory.PROVIDER_QUOTA_EXHAUSTED)]
+    )
+    fallback_adapter = ScriptedExecutionAdapter(
+        [
+            AdapterResponse(
+                text="BUY",
+                model_id="qwen/qwen3.7-plus",
+                usage=LLMUsage(input_tokens=40, output_tokens=20),
+                sampling_wire=wire,
+            )
+        ]
+    )
+    service, _credits_store = _execution_service(
+        tmp_path,
+        monkeypatch,
+        primary_adapter,
+        adapters={"openrouter": primary_adapter, "commonstack": fallback_adapter},
+    )
+    request = _failover_request("wire-run").model_copy(
+        update={"model_id": "qwen/qwen3.7-plus"}
+    )
+
+    result = service.execute(request)
+
+    assert result.provider_id == "commonstack"
+    assert result.sampling_wire == expected
